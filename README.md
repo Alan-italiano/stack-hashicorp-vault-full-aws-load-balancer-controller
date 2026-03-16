@@ -71,7 +71,8 @@ tofu output route53_zone_id
 - Rate limiting por IP no WAF, configurado por `alb_waf_rate_limit` por janela de 5 minutos.
 - `routing.http.drop_invalid_header_fields.enabled=true` para reduzir risco de HTTP desync.
 - `routing.http.desync_mitigation_mode=strictest` no ALB.
-- `deletion_protection.enabled=true` por padrao.
+- `deletion_protection.enabled=false` por padrao em lab para facilitar o `destroy`.
+- Se quiser um ambiente mais protegido contra remocao acidental, defina `alb_enable_deletion_protection = true` conscientemente.
 - `Shield Advanced` opcional via `alb_enable_shield_advanced = true`.
 
 ## DNS Mais Rapido

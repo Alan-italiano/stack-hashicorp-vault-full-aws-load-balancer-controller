@@ -65,9 +65,9 @@ variable "alb_ssl_policy" {
 }
 
 variable "alb_enable_deletion_protection" {
-  description = "Enable deletion protection on the public ALB"
+  description = "Enable deletion protection on the public ALB. For lab environments, keeping this false makes destroy safer."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "alb_enable_shield_advanced" {
