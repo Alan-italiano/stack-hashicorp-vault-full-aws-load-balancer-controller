@@ -89,12 +89,27 @@ jobs:
           echo "VPC ID: $VPC_ID"
 
       # ── 5. Pré-destroy: remove K8s resources que criam AWS LBs ───────────
+      # O AWS LB Controller adiciona finalizers (group.ingress.k8s.aws/* e
+      # service.k8s.aws/resources) que bloqueiam o kubectl delete enquanto
+      # aguardam a limpeza de recursos AWS. Se o controller perder conectividade
+      # com a AWS, o finalizer nunca é removido e o kubectl trava indefinidamente.
+      # Solução: remover os finalizers explicitamente antes de deletar.
       - name: Pre-destroy - delete Ingress and LoadBalancer Service via kubectl
         run: |
           if aws eks describe-cluster --name "${{ env.CLUSTER_NAME }}" \
                --query "cluster.status" --output text 2>/dev/null | grep -q ACTIVE; then
             aws eks update-kubeconfig \
               --name "${{ env.CLUSTER_NAME }}" --region "${{ env.AWS_REGION }}"
+
+            # Remove finalizers para evitar travamento quando o LB Controller
+            # não consegue alcançar a AWS API (i/o timeout)
+            kubectl patch ingress vault-alb -n vault \
+              -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
+            kubectl patch ingress grafana-alb -n monitoring \
+              -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
+            kubectl patch service postgres-service -n postgres \
+              -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
+
             kubectl delete ingress vault-alb        -n vault      --ignore-not-found || true
             kubectl delete ingress grafana-alb      -n monitoring --ignore-not-found || true
             kubectl delete service postgres-service -n postgres   --ignore-not-found || true
