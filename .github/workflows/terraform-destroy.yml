@@ -102,7 +102,20 @@ jobs:
               --name "${{ env.CLUSTER_NAME }}" --region "${{ env.AWS_REGION }}"
 
             # Remove finalizers para evitar travamento quando o LB Controller
-            # não consegue alcançar a AWS API (i/o timeout)
+            # não consegue alcançar a AWS API (i/o timeout).
+            # Inclui Ingress, Service E TargetGroupBindings — o LB Controller
+            # cria TGBs com finalizer elbv2.k8s.aws/resources para cada backend,
+            # e eles bloqueiam a deleção das namespaces se não forem limpos.
+            for NS in vault monitoring postgres cert-manager external-dns kube-system; do
+              # Remove finalizers de todos os TargetGroupBindings na namespace
+              for TGB in $(kubectl get targetgroupbinding -n "$NS" -o name 2>/dev/null); do
+                echo "  Removendo finalizer de $TGB em $NS"
+                kubectl patch "$TGB" -n "$NS" \
+                  -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
+                kubectl delete "$TGB" -n "$NS" --ignore-not-found 2>/dev/null || true
+              done
+            done
+
             kubectl patch ingress vault-alb -n vault \
               -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
             kubectl patch ingress grafana-alb -n monitoring \
