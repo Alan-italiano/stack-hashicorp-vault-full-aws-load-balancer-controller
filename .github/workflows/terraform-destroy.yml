@@ -66,7 +66,7 @@ jobs:
         run: |
           BUCKET="${{ secrets.TF_STATE_BUCKET }}"
           if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
-            echo "ERRO: bucket de state '$BUCKET' não encontrado. Execute o workflow de Apply primeiro."
+            echo "ERRO: bucket de state '$BUCKET' não encontrado."
             exit 1
           fi
           echo "Bucket $BUCKET encontrado."
@@ -83,54 +83,111 @@ jobs:
           TF_VAR_postgres_admin_password:  ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
           TF_VAR_vault_oidc_client_secret: ${{ secrets.VAULT_OIDC_CLIENT_SECRET }}
 
-      # ── 6. Pré-destroy: remove recursos K8s que criam AWS resources ────────
-      # O AWS Load Balancer Controller e o serviço postgres criam recursos AWS
-      # (ALB, NLB/ELB) fora do controle direto do Terraform. Se esses recursos
-      # ainda existirem quando o Terraform tentar deletar a VPC, as subnets e o
-      # IGW ficam bloqueados por ENIs pendentes. Este step garante que o ALB e o
-      # ELB sejam removidos ANTES do destroy da infraestrutura.
+      # ── 6. Pré-destroy: remove recursos K8s que criam AWS LBs ─────────────
+      # Os Ingress (ALB) e o postgres LoadBalancer Service criam recursos AWS
+      # fora do controle direto do Terraform. Se esses LBs ainda existirem
+      # quando o Terraform tentar destruir a VPC, as subnets e o IGW ficam
+      # bloqueados por ENIs pendentes (DependencyViolation).
+      #
+      # Estratégia:
+      #   1. Deletar via kubectl para acionar o controller (caminho limpo)
+      #   2. Aguardar o controller remover os LBs da AWS
+      #   3. Se restarem LBs após o timeout, forçar deleção via AWS CLI
+      #   4. Remover do Terraform state para que o destroy não tente gerenciá-los
       - name: Configure kubeconfig
         run: |
           aws eks update-kubeconfig \
             --name "${{ env.CLUSTER_NAME }}" \
             --region "${{ env.AWS_REGION }}"
 
-      - name: Pre-destroy - remove Kubernetes Ingress resources (triggers ALB deletion)
+      - name: Pre-destroy - delete Ingress and LoadBalancer Service via kubectl
         run: |
-          echo "Deletando Ingress resources para forçar remoção dos ALBs..."
-          kubectl delete ingress vault-alb      -n vault      --ignore-not-found --timeout=5m
-          kubectl delete ingress grafana-alb    -n monitoring --ignore-not-found --timeout=5m
-          echo "Ingress deletados."
+          kubectl delete ingress vault-alb    -n vault      --ignore-not-found
+          kubectl delete ingress grafana-alb  -n monitoring --ignore-not-found
+          kubectl delete service postgres-service -n postgres --ignore-not-found
+          echo "Recursos Kubernetes deletados."
 
-      - name: Pre-destroy - remove postgres LoadBalancer service (triggers ELB deletion)
+      - name: Pre-destroy - wait for AWS LBs to be removed by the controller
         run: |
-          echo "Deletando postgres LoadBalancer service..."
-          kubectl delete service postgres-service -n postgres --ignore-not-found --timeout=5m
-          echo "Serviço deletado."
+          VPC_ID=$(aws eks describe-cluster \
+            --name "${{ env.CLUSTER_NAME }}" \
+            --query "cluster.resourcesVpcConfig.vpcId" \
+            --output text 2>/dev/null || echo "")
 
-      - name: Pre-destroy - wait for ALB/ELB to be fully removed by AWS
-        run: |
-          echo "Aguardando AWS remover os load balancers (até 10min)..."
-          DEADLINE=$((SECONDS + 600))
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+            echo "Cluster/VPC não encontrado — sem LBs para aguardar."
+            exit 0
+          fi
+
+          echo "VPC: $VPC_ID — aguardando remoção dos LBs (até 5min)..."
+          DEADLINE=$((SECONDS + 300))
           while [ $SECONDS -lt $DEADLINE ]; do
             COUNT=$(aws elbv2 describe-load-balancers \
-              --query "LoadBalancers[?contains(DNSName, 'k8s-vault') || contains(DNSName, 'k8s-monitoring')].DNSName" \
-              --output text 2>/dev/null | wc -w)
-            if [ "$COUNT" -eq 0 ]; then
-              echo "Todos os ALBs foram removidos."
-              break
-            fi
-            echo "  Ainda existem $COUNT ALB(s). Aguardando..."
+              --query "length(LoadBalancers[?VpcId=='$VPC_ID'])" \
+              --output text 2>/dev/null || echo "0")
+            [ "$COUNT" -eq 0 ] && echo "Todos os LBs foram removidos pelo controller." && exit 0
+            echo "  $COUNT LB(s) ainda existem. Aguardando 15s..."
             sleep 15
           done
+          echo "Timeout — prosseguindo para força deleção via AWS CLI."
 
-          # Verificação final — não bloqueia o destroy se ainda restar algum
-          REMAINING=$(aws elbv2 describe-load-balancers \
-            --query "length(LoadBalancers[?contains(DNSName, 'k8s-vault') || contains(DNSName, 'k8s-monitoring')])" \
-            --output text 2>/dev/null || echo "0")
-          echo "ALBs restantes após espera: ${REMAINING:-0}"
+      - name: Pre-destroy - force delete remaining LBs and target groups via AWS CLI
+        run: |
+          VPC_ID=$(aws eks describe-cluster \
+            --name "${{ env.CLUSTER_NAME }}" \
+            --query "cluster.resourcesVpcConfig.vpcId" \
+            --output text 2>/dev/null || echo "")
 
-      # ── 7. Terraform Plan -destroy ────────────────────────────────────────
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+            echo "Cluster/VPC não encontrado — nada a forçar."
+            exit 0
+          fi
+
+          LB_ARNS=$(aws elbv2 describe-load-balancers \
+            --query "LoadBalancers[?VpcId=='$VPC_ID'].LoadBalancerArn" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$LB_ARNS" ]; then
+            echo "Nenhum LB restante na VPC."
+            exit 0
+          fi
+
+          for ARN in $LB_ARNS; do
+            echo "Force-deleting LB: $ARN"
+            aws elbv2 delete-load-balancer --load-balancer-arn "$ARN" || true
+          done
+
+          # Aguarda os LBs serem removidos para liberar os target groups
+          echo "Aguardando 60s para LBs serem removidos..."
+          sleep 60
+
+          # Remove target groups órfãos na VPC
+          TG_ARNS=$(aws elbv2 describe-target-groups \
+            --query "TargetGroups[?VpcId=='$VPC_ID'].TargetGroupArn" \
+            --output text 2>/dev/null || echo "")
+
+          for TG_ARN in $TG_ARNS; do
+            echo "Deleting target group: $TG_ARN"
+            aws elbv2 delete-target-group --target-group-arn "$TG_ARN" || true
+          done
+
+          # Aguarda ENIs serem liberadas
+          echo "Aguardando 30s para ENIs serem liberadas..."
+          sleep 30
+
+      # ── 7. Remove recursos deletados do Terraform state ───────────────────
+      # Evita que o `tofu destroy` falhe com "still exists" em recursos que
+      # já foram removidos manualmente nos passos anteriores.
+      - name: Remove pre-deleted resources from Terraform state
+        run: |
+          tofu state rm kubernetes_ingress_v1.vault   || true
+          tofu state rm kubernetes_ingress_v1.grafana || true
+          tofu state rm kubernetes_service_v1.postgres || true
+        env:
+          TF_VAR_postgres_admin_password:  ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
+          TF_VAR_vault_oidc_client_secret: ${{ secrets.VAULT_OIDC_CLIENT_SECRET }}
+
+      # ── 8. Terraform Plan -destroy ────────────────────────────────────────
       - name: Terraform Plan (destroy)
         run: |
           tofu plan \
@@ -152,7 +209,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ── 8. Terraform Destroy ──────────────────────────────────────────────
+      # ── 9. Terraform Destroy ──────────────────────────────────────────────
       - name: Terraform Destroy
         run: tofu apply -auto-approve destroy.tfplan
         env:
