@@ -69,11 +69,18 @@ jobs:
           TF_VAR_postgres_admin_password:  ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
           TF_VAR_vault_oidc_client_secret: ${{ secrets.VAULT_OIDC_CLIENT_SECRET }}
 
-      # ── 4. Captura VPC ID antes de qualquer destroy ───────────────────────
-      - name: Get VPC ID
-        id: vpc
+      # ── 4. Captura status do cluster e VPC ID ────────────────────────────
+      # Feito antes de qualquer deleção para que os outputs estejam disponíveis
+      # em todos os passos seguintes, mesmo após o cluster ser removido.
+      - name: Get cluster info
+        id: cluster
         run: |
-          VPC_ID=$(aws eks describe-cluster \
+          CLUSTER_STATUS=$(timeout 20 aws eks describe-cluster \
+            --name "${{ env.CLUSTER_NAME }}" \
+            --query "cluster.status" \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+
+          VPC_ID=$(timeout 20 aws eks describe-cluster \
             --name "${{ env.CLUSTER_NAME }}" \
             --query "cluster.resourcesVpcConfig.vpcId" \
             --output text 2>/dev/null || echo "")
@@ -85,38 +92,51 @@ jobs:
               --output text 2>/dev/null || echo "")
           fi
 
-          echo "vpc_id=$VPC_ID" >> "$GITHUB_OUTPUT"
-          echo "VPC ID: $VPC_ID"
+          echo "cluster_status=$CLUSTER_STATUS" >> "$GITHUB_OUTPUT"
+          echo "vpc_id=$VPC_ID"                 >> "$GITHUB_OUTPUT"
+          echo "Cluster: $CLUSTER_STATUS | VPC: $VPC_ID"
 
-      # ── 5. Pré-destroy: remove K8s resources que criam AWS LBs ───────────
-      # Timeout de 3min + continue-on-error para evitar travamento:
-      # kubectl e aws eks update-kubeconfig podem pendurar indefinidamente se
-      # o cluster estiver em DELETING ou com webhooks do LB Controller inativos.
-      # Os ALBs são removidos via AWS CLI direto no passo 6 de qualquer forma.
-      - name: Pre-destroy - delete Ingress and LoadBalancer Service via kubectl
+      # ── 5. Pré-destroy: limpa recursos K8s que criam AWS LBs ──────────────
+      # Este passo é best-effort (continue-on-error + timeout 3min).
+      # Objetivo: sinalizar ao LB Controller para remover ALBs/NLBs via API
+      # Kubernetes antes de pré-deletarmos os nodes (passo 8).
+      #
+      # Problemas tratados:
+      # - Finalizer "group.ingress.k8s.aws/*" nos Ingresses
+      #   → kubectl delete trava aguardando limpeza AWS que nunca vem
+      # - Finalizer "elbv2.k8s.aws/resources" nos TargetGroupBindings
+      #   → namespace fica em Terminating quando controller está sem conectividade
+      # - Finalizer "service.k8s.aws/resources" nos LoadBalancer Services
+      #   → kubectl delete trava
+      #
+      # Se o cluster não estiver ACTIVE ou o kubectl travar, continue-on-error
+      # garante que o workflow avance — os LBs são removidos via AWS CLI no
+      # passo seguinte e todos os recursos k8s saem do state no passo 10.
+      - name: Pre-destroy - remove K8s LB resources and finalizers
         continue-on-error: true
         timeout-minutes: 3
         run: |
-          CLUSTER_STATUS=$(timeout 20 aws eks describe-cluster \
-            --name "${{ env.CLUSTER_NAME }}" \
-            --query "cluster.status" \
-            --output text 2>/dev/null || echo "NOT_FOUND")
-
-          echo "Cluster status: $CLUSTER_STATUS"
-
+          CLUSTER_STATUS="${{ steps.cluster.outputs.cluster_status }}"
           if [ "$CLUSTER_STATUS" != "ACTIVE" ]; then
-            echo "Cluster não está ACTIVE — pulando kubectl."
+            echo "Cluster não está ACTIVE ($CLUSTER_STATUS) — pulando kubectl."
             exit 0
           fi
 
           timeout 30 aws eks update-kubeconfig \
-            --name "${{ env.CLUSTER_NAME }}" --region "${{ env.AWS_REGION }}" || exit 0
+            --name "${{ env.CLUSTER_NAME }}" \
+            --region "${{ env.AWS_REGION }}" || {
+            echo "Falha ao configurar kubeconfig — pulando kubectl."
+            exit 0
+          }
 
-          # Remove finalizers de TargetGroupBindings (criados pelo LB Controller)
-          # e dos Ingresses/Services para evitar namespace Terminating stuck.
+          # Remove finalizers de todos os TargetGroupBindings.
+          # O LB Controller cria TGBs em cada namespace para os backends ALB/NLB.
+          # Com nodes mortos, o controller não consegue remover os finalizers →
+          # a namespace fica em Terminating para sempre.
           for NS in vault monitoring postgres cert-manager external-dns kube-system; do
-            for TGB in $(timeout 10 kubectl get targetgroupbinding -n "$NS" -o name 2>/dev/null); do
-              echo "  Removendo finalizer de $TGB em $NS"
+            for TGB in $(timeout 15 kubectl get targetgroupbinding \
+                -n "$NS" -o name 2>/dev/null || true); do
+              echo "  TGB finalizer: $TGB ($NS)"
               timeout 10 kubectl patch "$TGB" -n "$NS" \
                 -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
               timeout 10 kubectl delete "$TGB" -n "$NS" \
@@ -124,49 +144,61 @@ jobs:
             done
           done
 
-          for RESOURCE in \
-            "ingress/vault-alb::vault" \
-            "ingress/grafana-alb::monitoring" \
-            "service/postgres-service::postgres"; do
-            NAME=$(echo "$RESOURCE" | cut -d: -f1)
-            NS=$(echo "$RESOURCE" | cut -d: -f3)
-            timeout 10 kubectl patch "$NAME" -n "$NS" \
+          # Remove finalizers e deleta Ingresses e LoadBalancer Service.
+          for NS_NAME_KIND in \
+            "vault:vault-alb:ingress" \
+            "monitoring:grafana-alb:ingress" \
+            "postgres:postgres-service:service"; do
+            NS="${NS_NAME_KIND%%:*}"
+            REST="${NS_NAME_KIND#*:}"
+            NAME="${REST%%:*}"
+            KIND="${REST##*:}"
+            timeout 10 kubectl patch "$KIND/$NAME" -n "$NS" \
               -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
-            timeout 10 kubectl delete "$NAME" -n "$NS" \
+            timeout 10 kubectl delete "$KIND/$NAME" -n "$NS" \
               --ignore-not-found 2>/dev/null || true
           done
 
           echo "Recursos Kubernetes processados."
 
-      # ── 6. Force-delete LBs na VPC e aguarda ENIs liberarem ───────────────
-      - name: Pre-destroy - force delete all LBs in VPC
+      # ── 6. Force-delete LBs e Target Groups na VPC ────────────────────────
+      # Se o cluster estava ACTIVE, aguarda até 3min pelo LB Controller limpar
+      # os ALBs/NLBs acionados no passo anterior. Se o cluster já está gone,
+      # não há controller rodando — força deleção imediata sem espera.
+      - name: Pre-destroy - force delete all LBs and Target Groups
         run: |
-          VPC_ID="${{ steps.vpc.outputs.vpc_id }}"
+          VPC_ID="${{ steps.cluster.outputs.vpc_id }}"
           if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
             echo "VPC não encontrada — sem LBs para limpar."
             exit 0
           fi
 
-          echo "Aguardando até 3min pelo AWS LB Controller..."
-          DEADLINE=$((SECONDS + 180))
-          while [ $SECONDS -lt $DEADLINE ]; do
-            COUNT=$(aws elbv2 describe-load-balancers \
-              --query "length(LoadBalancers[?VpcId=='$VPC_ID'])" \
-              --output text 2>/dev/null || echo "0")
-            [ "$COUNT" -eq "0" ] && echo "Nenhum LB na VPC." && break
-            echo "  $COUNT LB(s) ainda presentes. Aguardando 15s..."
-            sleep 15
-          done
+          CLUSTER_STATUS="${{ steps.cluster.outputs.cluster_status }}"
+
+          if [ "$CLUSTER_STATUS" = "ACTIVE" ]; then
+            echo "Aguardando até 3min pelo LB Controller limpar ALBs/NLBs..."
+            for i in $(seq 1 12); do
+              COUNT=$(aws elbv2 describe-load-balancers \
+                --query "length(LoadBalancers[?VpcId=='$VPC_ID'])" \
+                --output text 2>/dev/null || echo "0")
+              if [ "${COUNT:-0}" -eq "0" ]; then
+                echo "Nenhum LB na VPC."
+                break
+              fi
+              echo "  ${COUNT} LB(s) ainda presentes — aguardando 15s... ($i/12)"
+              sleep 15
+            done
+          fi
 
           LB_ARNS=$(aws elbv2 describe-load-balancers \
             --query "LoadBalancers[?VpcId=='$VPC_ID'].LoadBalancerArn" \
             --output text 2>/dev/null || echo "")
-          for ARN in $LB_ARNS; do
-            echo "  Forçando deleção: $ARN"
-            aws elbv2 delete-load-balancer --load-balancer-arn "$ARN" || true
-          done
 
           if [ -n "$LB_ARNS" ]; then
+            for ARN in $LB_ARNS; do
+              echo "  Forçando deleção LB: $ARN"
+              aws elbv2 delete-load-balancer --load-balancer-arn "$ARN" || true
+            done
             echo "Aguardando 90s para ENIs dos LBs serem liberadas..."
             sleep 90
           fi
@@ -175,22 +207,23 @@ jobs:
             --query "TargetGroups[?VpcId=='$VPC_ID'].TargetGroupArn" \
             --output text 2>/dev/null || echo "")
           for TG_ARN in $TG_ARNS; do
-            echo "  Deletando target group: $TG_ARN"
+            echo "  Deletando Target Group: $TG_ARN"
             aws elbv2 delete-target-group --target-group-arn "$TG_ARN" || true
           done
 
       # ── 7. Remove SGs órfãos do LB Controller ────────────────────────────
-      # O AWS LB Controller cria SGs fora do Terraform. Eles referenciam o
-      # node SG (regras elbv2.k8s.aws/*) impedindo a exclusão da VPC.
+      # O LB Controller cria SGs com nome "k8s-*" fora do Terraform.
+      # Eles adicionam regras cross-SG no node SG (elbv2.k8s.aws/targetGroupBinding)
+      # que impedem a deleção dos SGs gerenciados pelo EKS → VPC não pode ser
+      # destruída (DependencyViolation).
       - name: Pre-destroy - delete orphaned LB Controller security groups
         run: |
-          VPC_ID="${{ steps.vpc.outputs.vpc_id }}"
+          VPC_ID="${{ steps.cluster.outputs.vpc_id }}"
           if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
             echo "VPC não encontrada — pulando limpeza de SGs."
             exit 0
           fi
 
-          # Identifica SGs órfãos pelo padrão de nome do LB Controller
           ORPHAN_SGS=$(aws ec2 describe-security-groups \
             --filters "Name=vpc-id,Values=$VPC_ID" \
             --query "SecurityGroups[?starts_with(GroupName,'k8s-')].GroupId" \
@@ -201,42 +234,42 @@ jobs:
             exit 0
           fi
 
-          # Remove regras cross-SG que referenciam os SGs órfãos do Node SG
-          NODE_SG=$(aws ec2 describe-security-groups \
+          # Revoga regras cross-SG em todos os SGs EKS que referenciam os órfãos
+          EKS_SGS=$(aws ec2 describe-security-groups \
             --filters \
               "Name=vpc-id,Values=$VPC_ID" \
               "Name=tag:aws:eks:cluster-name,Values=${{ env.CLUSTER_NAME }}" \
-            --query "SecurityGroups[?contains(GroupName,'node')].GroupId | [0]" \
+            --query "SecurityGroups[*].GroupId" \
             --output text 2>/dev/null || echo "")
 
-          if [ -n "$NODE_SG" ] && [ "$NODE_SG" != "None" ]; then
+          for EKS_SG in $EKS_SGS; do
             for ORPHAN_SG in $ORPHAN_SGS; do
               RULE_IDS=$(aws ec2 describe-security-group-rules \
-                --filters "Name=group-id,Values=$NODE_SG" \
+                --filters "Name=group-id,Values=$EKS_SG" \
                 --query "SecurityGroupRules[?ReferencedGroupInfo.GroupId=='$ORPHAN_SG'].SecurityGroupRuleId" \
                 --output text 2>/dev/null || echo "")
               for RULE_ID in $RULE_IDS; do
-                echo "  Removendo regra $RULE_ID do Node SG que referencia $ORPHAN_SG"
+                echo "  Revogando regra $RULE_ID em $EKS_SG → $ORPHAN_SG"
                 aws ec2 revoke-security-group-ingress \
-                  --group-id "$NODE_SG" \
-                  --security-group-rule-ids "$RULE_ID" || true
+                  --group-id "$EKS_SG" \
+                  --security-group-rule-ids "$RULE_ID" 2>/dev/null || true
               done
             done
-          fi
-
-          # Deleta os SGs órfãos
-          for SG in $ORPHAN_SGS; do
-            NAME=$(aws ec2 describe-security-groups --group-ids "$SG" \
-              --query "SecurityGroups[0].GroupName" --output text 2>/dev/null || echo "?")
-            echo "  Deletando SG órfão: $SG ($NAME)"
-            aws ec2 delete-security-group --group-id "$SG" || true
           done
 
-      # ── 8. Pré-deleta EKS node groups e aguarda término das instâncias ────
-      # O problema raiz: Terraform destrói o node group e imediatamente tenta
-      # deletar as subnets, mas as ENIs das instâncias EC2 ainda não foram
-      # liberadas → DependencyViolation. Pré-deletando e aguardando, garantimos
-      # que as ENIs estão liberadas quando o Terraform chegar na VPC.
+          for SG in $ORPHAN_SGS; do
+            SG_NAME=$(aws ec2 describe-security-groups --group-ids "$SG" \
+              --query "SecurityGroups[0].GroupName" --output text 2>/dev/null || echo "?")
+            echo "  Deletando SG: $SG ($SG_NAME)"
+            aws ec2 delete-security-group --group-id "$SG" 2>/dev/null || true
+          done
+
+      # ── 8. Pré-deleta EKS node groups e aguarda ENIs liberarem ────────────
+      # Sem isso: Terraform destrói o node group → EC2 encerra instâncias →
+      # ENIs ainda presentes nas subnets → Terraform tenta deletar as subnets
+      # imediatamente → DependencyViolation.
+      # Com "aws eks wait nodegroup-deleted", as instâncias estão terminadas
+      # e as ENIs liberadas antes do Terraform chegar na VPC.
       - name: Pre-destroy - delete EKS node groups and wait
         run: |
           NODE_GROUPS=$(aws eks list-nodegroups \
@@ -253,52 +286,82 @@ jobs:
             echo "Deletando node group: $NG"
             aws eks delete-nodegroup \
               --cluster-name "${{ env.CLUSTER_NAME }}" \
-              --nodegroup-name "$NG" 2>/dev/null || echo "  Já deletado ou erro ignorado."
+              --nodegroup-name "$NG" 2>/dev/null \
+              || echo "  Ignorado (já deletado ou erro)."
           done
 
-          echo "Aguardando deleção dos node groups (timeout: 30min)..."
+          echo "Aguardando conclusão da deleção (timeout: 30min)..."
           for NG in $NODE_GROUPS; do
             echo "  Aguardando: $NG"
             aws eks wait nodegroup-deleted \
               --cluster-name "${{ env.CLUSTER_NAME }}" \
-              --nodegroup-name "$NG" 2>/dev/null || echo "  Node group $NG já inexistente."
+              --nodegroup-name "$NG" 2>/dev/null \
+              || echo "  $NG já inexistente."
           done
 
           echo "Todos os node groups deletados. ENIs das instâncias liberadas."
 
-      # ── 9. Remove recursos Kubernetes/Helm do Terraform state ────────────
-      # Quando os node groups são deletados no passo anterior, todos os pods
-      # morrem — incluindo controllers (LB Controller, EBS CSI Driver, etc.).
-      # Se o tofu destroy tentar destruir kubernetes_namespace ou helm_release,
-      # o Kubernetes provider aguarda finalizers que nunca serão removidos
-      # (controllers mortos) → context deadline exceeded.
+      # ── 9. Remove volumes EBS órfãos de PVCs ─────────────────────────────
+      # Com o EBS CSI Driver morto (nodes deletados), os volumes das PVCs
+      # não são deletados automaticamente. Eles ficam como "available" (custo
+      # residual) mas não bloqueiam a VPC. Limpamos preventivamente aqui.
+      - name: Pre-destroy - delete orphaned EBS volumes from PVCs
+        run: |
+          VOL_IDS=$(aws ec2 describe-volumes \
+            --filters \
+              "Name=tag:kubernetes.io/cluster/${{ env.CLUSTER_NAME }},Values=owned" \
+              "Name=status,Values=available" \
+            --query "Volumes[*].VolumeId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$VOL_IDS" ]; then
+            echo "Nenhum volume EBS órfão encontrado."
+            exit 0
+          fi
+
+          for VOL_ID in $VOL_IDS; do
+            echo "  Deletando volume EBS: $VOL_ID"
+            aws ec2 delete-volume --volume-id "$VOL_ID" 2>/dev/null || true
+          done
+          echo "Volumes EBS órfãos removidos."
+
+      # ── 10. Remove recursos Kubernetes/Helm do Terraform state ────────────
+      # Com os nodes deletados, todos os controllers morrem (LB Controller,
+      # EBS CSI Driver, Prometheus Operator etc.). Se o tofu destroy tentar
+      # destruir kubernetes_namespace ou helm_release, o provider aguarda
+      # finalizers que nunca serão removidos → "context deadline exceeded".
       #
-      # Solução: remover TODOS os recursos kubernetes_* e helm_release do state.
-      # O tofu destroy opera apenas sobre recursos AWS (EKS, VPC, IAM, etc.),
-      # que são destruídos via API sem depender dos controllers k8s.
-      # O etcd (e todos os objetos k8s) é destruído junto com o control plane.
+      # Solução: remove TODOS os recursos kubernetes_*, helm_release.* e
+      # kubectl_manifest.* do state. O destroy opera apenas sobre recursos AWS
+      # (EKS control plane, VPC, IAM, KMS, S3, WAF, ACM, Route53) via API,
+      # sem precisar dos controllers k8s. O etcd e todos os objetos k8s são
+      # destruídos automaticamente com o control plane do EKS.
       - name: Remove Kubernetes and Helm resources from Terraform state
         run: |
-          echo "Removendo recursos kubernetes_* e helm_release do state..."
-          tofu state list 2>/dev/null \
-            | grep -E '^(kubernetes_|helm_release\.|kubectl_manifest\.)' \
-            | while read -r addr; do
-                echo "  Removendo: $addr"
-                tofu state rm "$addr" || true
-              done
+          K8S_ADDRS=$(tofu state list 2>/dev/null \
+            | grep -E '^(kubernetes_|helm_release\.|kubectl_manifest\.)' || true)
+          if [ -n "$K8S_ADDRS" ]; then
+            echo "$K8S_ADDRS" | while read -r addr; do
+              echo "  Removendo do state: $addr"
+              tofu state rm "$addr" || true
+            done
+          else
+            echo "Nenhum recurso kubernetes_*/helm_release no state."
+          fi
 
-          echo "Removendo node groups deletados do state..."
-          tofu state list 2>/dev/null \
-            | grep 'aws_eks_node_group' \
-            | while read -r addr; do
-                echo "  Removendo: $addr"
-                tofu state rm "$addr" || true
-              done
+          NG_ADDRS=$(tofu state list 2>/dev/null \
+            | grep 'aws_eks_node_group' || true)
+          if [ -n "$NG_ADDRS" ]; then
+            echo "$NG_ADDRS" | while read -r addr; do
+              echo "  Removendo node group do state: $addr"
+              tofu state rm "$addr" || true
+            done
+          fi
         env:
           TF_VAR_postgres_admin_password:  ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
           TF_VAR_vault_oidc_client_secret: ${{ secrets.VAULT_OIDC_CLIENT_SECRET }}
 
-      # ── 10. Terraform Plan -destroy ───────────────────────────────────────
+      # ── 11. Terraform Plan -destroy ───────────────────────────────────────
       - name: Terraform Plan (destroy)
         run: |
           tofu plan \
@@ -319,7 +382,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ── 11. Terraform Destroy ─────────────────────────────────────────────
+      # ── 12. Terraform Destroy ─────────────────────────────────────────────
       - name: Terraform Destroy
         run: tofu apply -auto-approve destroy.tfplan
         env:
@@ -330,5 +393,5 @@ jobs:
         run: |
           {
             echo "### Destroy concluído em $(date -u '+%Y-%m-%d %H:%M UTC')"
-            echo "Toda a infraestrutura foi removida."
+            echo "Toda a infraestrutura foi removida com sucesso."
           } >> "$GITHUB_STEP_SUMMARY"
