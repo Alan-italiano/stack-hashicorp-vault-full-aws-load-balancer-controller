@@ -2,8 +2,9 @@ module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "~> 20.0"
 
-  cluster_name    = var.cluster_name
-  cluster_version = var.kubernetes_version
+  cluster_name              = var.cluster_name
+  cluster_version           = var.kubernetes_version
+  cluster_service_ipv4_cidr = var.cluster_service_ipv4_cidr
 
   cluster_endpoint_public_access           = true
   cluster_endpoint_private_access          = true

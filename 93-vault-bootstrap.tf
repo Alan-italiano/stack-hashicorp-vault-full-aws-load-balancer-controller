@@ -17,6 +17,8 @@ resource "kubernetes_cluster_role_binding_v1" "vault_auth_delegator" {
 }
 
 resource "null_resource" "vault_bootstrap" {
+  count = var.vault_bootstrap_enabled ? 1 : 0
+
   triggers = {
     always_run               = timestamp()
     script_hash              = filesha1("${path.module}/scripts/bootstrap_vault.py")
@@ -28,6 +30,12 @@ resource "null_resource" "vault_bootstrap" {
     vault_ca_cert_hash       = sha1(tls_self_signed_cert.vault_internal_ca.cert_pem)
     vault_db_connection_name = "postgres"
     vault_db_role_name       = "postgres-dynamic"
+    vault_oidc_discovery_url = coalesce(var.vault_oidc_discovery_url, "")
+    vault_oidc_client_id     = coalesce(var.vault_oidc_client_id, "")
+    vault_oidc_client_secret = sha1(coalesce(var.vault_oidc_client_secret, ""))
+    vault_oidc_bound_email   = coalesce(var.vault_oidc_bound_email, "")
+    vault_oidc_role_name     = var.vault_oidc_role_name
+    vault_hostname           = var.vault_hostname
   }
 
   provisioner "local-exec" {
@@ -41,7 +49,6 @@ resource "null_resource" "vault_bootstrap" {
         --kubernetes-ca-b64 "${module.eks.cluster_certificate_authority_data}" \
         --vault-ca-cert-b64 "${base64encode(tls_self_signed_cert.vault_internal_ca.cert_pem)}" \
         --output-file "${path.module}/bootstrap/vault-init.json" \
-        --log-file "${path.module}/bootstrap/vault-bootstrap.log" \
         --postgres-host "postgres-service.${local.postgres_namespace}.svc.cluster.local" \
         --postgres-port "5432" \
         --postgres-database-name "${var.postgres_database_name}" \
@@ -49,7 +56,12 @@ resource "null_resource" "vault_bootstrap" {
         --postgres-admin-password "${var.postgres_admin_password}" \
         --vault-db-connection-name "postgres" \
         --vault-db-role-name "postgres-dynamic" \
-        >> "${path.module}/bootstrap/vault-bootstrap.log" 2>&1
+        --vault-hostname "${var.vault_hostname}" \
+        --oidc-discovery-url "${coalesce(var.vault_oidc_discovery_url, "")}" \
+        --oidc-client-id "${coalesce(var.vault_oidc_client_id, "")}" \
+        --oidc-client-secret "${coalesce(var.vault_oidc_client_secret, "")}" \
+        --oidc-bound-email "${coalesce(var.vault_oidc_bound_email, "")}" \
+        --oidc-role-name "${var.vault_oidc_role_name}"
     EOT
   }
 
@@ -57,7 +69,7 @@ resource "null_resource" "vault_bootstrap" {
     module.eks,
     module.irsa_vault,
     helm_release.cert_manager,
-    null_resource.wait_for_certificates,
+    kubectl_manifest.vault_server_certificate,
     kubernetes_namespace.vault,
     kubernetes_role_binding_v1.vault_discovery,
     kubernetes_cluster_role_binding_v1.vault_auth_delegator,

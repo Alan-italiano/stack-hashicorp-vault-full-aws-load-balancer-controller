@@ -1,4 +1,6 @@
 resource "kubernetes_namespace" "cert_manager" {
+  depends_on = [time_sleep.eks_access_ready]
+
   metadata {
     name = local.cert_manager_namespace
   }
@@ -37,79 +39,71 @@ resource "helm_release" "cert_manager" {
   ]
 }
 
-resource "null_resource" "cert_manager_resources" {
-  triggers = {
-    vault_hostname        = var.vault_hostname
-    vault_namespace       = local.vault_namespace
-    internal_ca_cert_hash = sha1(tls_self_signed_cert.vault_internal_ca.cert_pem)
-  }
-
-  provisioner "local-exec" {
-    command = <<-EOT
-      cat <<EOF | kubectl apply -f -
-      apiVersion: cert-manager.io/v1
-      kind: Issuer
-      metadata:
-        name: vault-internal-ca
-        namespace: ${local.vault_namespace}
-      spec:
-        ca:
-          secretName: ${kubernetes_secret_v1.vault_internal_ca.metadata[0].name}
-      ---
-      apiVersion: cert-manager.io/v1
-      kind: Certificate
-      metadata:
-        name: vault-server-tls
-        namespace: ${local.vault_namespace}
-      spec:
-        secretName: vault-server-tls
-        duration: 2160h
-        renewBefore: 360h
-        issuerRef:
-          name: vault-internal-ca
-          kind: Issuer
-        commonName: ${var.vault_hostname}
-        dnsNames:
-          - ${var.vault_hostname}
-          - vault
-          - vault.${local.vault_namespace}
-          - vault.${local.vault_namespace}.svc
-          - vault.${local.vault_namespace}.svc.cluster.local
-          - vault-active.${local.vault_namespace}.svc
-          - vault-active.${local.vault_namespace}.svc.cluster.local
-          - vault-internal.${local.vault_namespace}.svc
-          - vault-internal.${local.vault_namespace}.svc.cluster.local
-          - '*.vault-internal.${local.vault_namespace}.svc.cluster.local'
-          - localhost
-        ipAddresses:
-          - 127.0.0.1
-        usages:
-          - server auth
-          - client auth
-          - digital signature
-          - key encipherment
-      EOF
-    EOT
-  }
+resource "kubectl_manifest" "vault_internal_ca_issuer" {
+  yaml_body = yamlencode({
+    apiVersion = "cert-manager.io/v1"
+    kind       = "Issuer"
+    metadata = {
+      name      = "vault-internal-ca"
+      namespace = local.vault_namespace
+    }
+    spec = {
+      ca = {
+        secretName = kubernetes_secret_v1.vault_internal_ca.metadata[0].name
+      }
+    }
+  })
 
   depends_on = [
     helm_release.cert_manager,
-    kubernetes_secret_v1.vault_internal_ca
+    kubernetes_namespace.vault,
+    kubernetes_secret_v1.vault_internal_ca,
   ]
 }
 
-resource "null_resource" "wait_for_certificates" {
-  triggers = {
-    certs_hash = sha1(null_resource.cert_manager_resources.id)
-  }
-
-  provisioner "local-exec" {
-    command = <<-EOT
-      kubectl wait --namespace ${local.vault_namespace} --for=condition=Ready certificate/vault-server-tls --timeout=10m
-    EOT
-  }
+resource "kubectl_manifest" "vault_server_certificate" {
+  yaml_body = yamlencode({
+    apiVersion = "cert-manager.io/v1"
+    kind       = "Certificate"
+    metadata = {
+      name      = "vault-server-tls"
+      namespace = local.vault_namespace
+    }
+    spec = {
+      secretName  = "vault-server-tls"
+      duration    = "2160h"
+      renewBefore = "360h"
+      issuerRef = {
+        name = "vault-internal-ca"
+        kind = "Issuer"
+      }
+      commonName = var.vault_hostname
+      dnsNames = [
+        var.vault_hostname,
+        "vault",
+        "vault.${local.vault_namespace}",
+        "vault.${local.vault_namespace}.svc",
+        "vault.${local.vault_namespace}.svc.cluster.local",
+        "vault-active.${local.vault_namespace}.svc",
+        "vault-active.${local.vault_namespace}.svc.cluster.local",
+        "vault-internal.${local.vault_namespace}.svc",
+        "vault-internal.${local.vault_namespace}.svc.cluster.local",
+        "*.vault-internal.${local.vault_namespace}.svc.cluster.local",
+        "localhost",
+      ]
+      ipAddresses = [
+        "127.0.0.1",
+      ]
+      usages = [
+        "server auth",
+        "client auth",
+        "digital signature",
+        "key encipherment",
+      ]
+    }
+  })
 
   depends_on = [
-    null_resource.cert_manager_resources
+    kubectl_manifest.vault_internal_ca_issuer,
   ]
 }

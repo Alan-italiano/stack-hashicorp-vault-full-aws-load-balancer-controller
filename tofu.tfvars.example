@@ -1,13 +1,64 @@
-region                        = "us-east-1"
-cluster_name                  = "vault-eks-lab"
-vault_snapshot_bucket_name    = "vault-lab-snapshots-example"
-domain_name                   = "lab-internal.com.br"
-route53_zone_id               = "Z085094335FXPD3PXEQRT"
-vault_hostname                = "vault.lab-internal.com.br"
-vault_image_tag               = "1.21.4"
-grafana_hostname              = "grafana.lab-internal.com.br"
+# ============================================================
+# tofu.tfvars.example
+# Copy this file to tofu.tfvars and fill in the values.
+# NEVER commit tofu.tfvars — it is excluded by .gitignore.
+# ============================================================
+
+# -----------------------------------------------------------
+# AWS / EKS
+# -----------------------------------------------------------
+region                     = "us-east-1"
+cluster_name               = "vault-eks-lab"
+
+# -----------------------------------------------------------
+# S3 — Vault Snapshots
+# -----------------------------------------------------------
+vault_snapshot_bucket_name = "vault-lab-snapshots-unique"
+vault_snapshot_bucket_admin_principal_arns = [
+  "arn:aws:iam::123456789012:user/terraform",
+]
+
+# -----------------------------------------------------------
+# DNS / Route53
+# -----------------------------------------------------------
+route53_zone_id            = "Z085094335FXPD3PXEQRT"
+domain_name                = "lab-internal.com.br"
+vault_hostname             = "vault.lab-internal.com.br"
+grafana_hostname           = "grafana.lab-internal.com.br"
+
+# -----------------------------------------------------------
+# ALB / WAF
+# -----------------------------------------------------------
 alb_enable_deletion_protection = false
-vault_allowed_cidrs           = ["203.0.113.10/32"]
-postgres_allowed_cidrs        = ["0.0.0.0/0"]
-postgres_database_name        = "psdb"
-postgres_admin_username       = "psuser"
+# vault_allowed_cidrs restricts Vault access to specific source IPs through the ALB.
+# Leave empty [] to keep Vault publicly reachable.
+vault_allowed_cidrs        = ["203.0.113.10/32"]
+
+# -----------------------------------------------------------
+# Vault
+# -----------------------------------------------------------
+vault_image_tag            = "1.21.4"
+
+# -----------------------------------------------------------
+# PostgreSQL
+# CAUTION: postgres_allowed_cidrs must NOT be 0.0.0.0/0 in production
+# -----------------------------------------------------------
+postgres_allowed_cidrs     = ["203.0.113.10/32"]   # restrict to your IP/VPN CIDR
+postgres_database_name     = "psdb"
+postgres_admin_username    = "psuser"
+
+# SENSITIVE: PostgreSQL admin password
+# Recommended: export TF_VAR_postgres_admin_password="your-password" instead of setting it here
+postgres_admin_password    = "change-me-strong-password"
+
+# -----------------------------------------------------------
+# Vault OIDC (Auth0 or any OIDC provider) — SENSITIVE
+# -----------------------------------------------------------
+vault_oidc_discovery_url   = "https://tenant.us.auth0.com"
+vault_oidc_client_id       = "your-auth0-client-id"
+
+# SENSITIVE: Auth0 / OIDC Client Secret
+# Recommended: export TF_VAR_vault_oidc_client_secret="your-secret" instead of setting it here
+vault_oidc_client_secret   = "your-auth0-client-secret"
+
+vault_oidc_bound_email     = "admin@lab-internal.com.br"

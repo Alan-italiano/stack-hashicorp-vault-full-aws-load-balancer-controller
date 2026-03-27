@@ -1,3 +1,14 @@
+locals {
+  vault_snapshot_bucket_allowed_principal_arns = distinct(concat(
+    var.vault_snapshot_bucket_admin_principal_arns,
+    [
+      data.aws_caller_identity.current.arn,
+      module.irsa_vault.iam_role_arn,
+      "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root"
+    ]
+  ))
+}
+
 resource "aws_s3_bucket" "vault_snapshots" {
   bucket        = var.vault_snapshot_bucket_name
   force_destroy = false
@@ -75,10 +86,7 @@ data "aws_iam_policy_document" "vault_snapshots_bucket" {
     condition {
       test     = "ArnNotEquals"
       variable = "aws:PrincipalArn"
-      values = [
-        module.irsa_vault.iam_role_arn,
-        "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root"
-      ]
+      values   = local.vault_snapshot_bucket_allowed_principal_arns
     }
   }
 
@@ -87,14 +95,17 @@ data "aws_iam_policy_document" "vault_snapshots_bucket" {
     effect = "Allow"
 
     principals {
-      type = "AWS"
-      identifiers = [
-        module.irsa_vault.iam_role_arn,
-        "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root"
-      ]
+      type        = "AWS"
+      identifiers = local.vault_snapshot_bucket_allowed_principal_arns
     }
 
     actions = [
+      "s3:GetBucketLocation",
+      "s3:GetBucketPolicy",
+      "s3:GetBucketPublicAccessBlock",
+      "s3:GetBucketTagging",
+      "s3:GetBucketVersioning",
+      "s3:GetEncryptionConfiguration",
       "s3:ListBucket",
       "s3:GetObject",
       "s3:PutObject",

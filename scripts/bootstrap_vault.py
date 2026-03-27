@@ -8,31 +8,19 @@ import ssl
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.error
 import urllib.request
 
 
-# The TLS context is initialized at runtime after Terraform passes the Vault CA.
+# The TLS contexts are initialized at runtime after Terraform passes the Vault and cluster CAs.
 TLS_CONTEXT = None
-LOG_FILE_HANDLE = None
-
-
-def initialize_log_file(log_file):
-    global LOG_FILE_HANDLE
-    if not log_file:
-        return
-
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    LOG_FILE_HANDLE = open(log_file, "a", encoding="utf-8")
+KUBERNETES_CONTEXT = None
 
 
 # Emit bootstrap progress in a consistent format for Terraform/local-exec logs.
 def log(message):
-    rendered = f"[vault-bootstrap] {message}"
-    print(rendered, flush=True)
-    if LOG_FILE_HANDLE is not None:
-        LOG_FILE_HANDLE.write(rendered + "\n")
-        LOG_FILE_HANDLE.flush()
+    print(f"[vault-bootstrap] {message}", flush=True)
 
 
 # Build an HTTPS context that validates the Vault CA chain while tolerating the
@@ -41,6 +29,13 @@ def build_tls_context(vault_ca_cert_b64):
     context = ssl.create_default_context()
     context.load_verify_locations(cadata=base64.b64decode(vault_ca_cert_b64).decode("utf-8"))
     context.check_hostname = False
+    return context
+
+
+# Build an HTTPS context for direct Kubernetes API calls using the cluster CA.
+def build_kubernetes_context(kubernetes_ca_b64):
+    context = ssl.create_default_context()
+    context.load_verify_locations(cadata=base64.b64decode(kubernetes_ca_b64).decode("utf-8"))
     return context
 
 
@@ -62,7 +57,7 @@ def run(command, capture_output=True, check=True):
 
 
 # Send authenticated requests to the Vault HTTP API and normalize expected responses.
-def request(method, url, payload=None, token=None, expected_statuses=None):
+def request(method, url, payload=None, token=None, expected_statuses=None, timeout=10):
     data = None
     headers = {}
 
@@ -76,7 +71,7 @@ def request(method, url, payload=None, token=None, expected_statuses=None):
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
 
     try:
-        with urllib.request.urlopen(req, timeout=10, context=TLS_CONTEXT) as response:
+        with urllib.request.urlopen(req, timeout=timeout, context=TLS_CONTEXT) as response:
             body = response.read().decode("utf-8")
             return response.status, json.loads(body) if body else {}
     except urllib.error.HTTPError as exc:
@@ -84,6 +79,54 @@ def request(method, url, payload=None, token=None, expected_statuses=None):
         if expected_statuses and exc.code in expected_statuses:
             return exc.code, json.loads(body) if body else {}
         raise RuntimeError(f"Vault API {method} {url} failed with {exc.code}: {body}") from exc
+    except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+        raise RuntimeError(f"Vault API {method} {url} timed out or failed to connect: {exc}") from exc
+
+
+# Ask AWS for a fresh EKS bearer token whenever the bootstrap needs to call Kubernetes directly.
+def get_kubernetes_bearer_token(cluster_name, region):
+    result = run(
+        [
+            "aws",
+            "eks",
+            "get-token",
+            "--cluster-name",
+            cluster_name,
+            "--region",
+            region,
+        ]
+    )
+    payload = json.loads(result.stdout)
+    token = payload.get("status", {}).get("token")
+    if not token:
+        raise RuntimeError("aws eks get-token returned an empty bearer token")
+    return token
+
+
+# Call the Kubernetes API directly so bootstrap is less dependent on local kubectl state.
+def kubernetes_request(method, kubernetes_host, path, cluster_name, region, payload=None, expected_statuses=None):
+    data = None
+    headers = {
+        "Authorization": f"Bearer {get_kubernetes_bearer_token(cluster_name, region)}",
+        "Accept": "application/json",
+    }
+
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    url = f"{kubernetes_host.rstrip('/')}{path}"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req, timeout=10, context=KUBERNETES_CONTEXT) as response:
+            body = response.read().decode("utf-8")
+            return response.status, json.loads(body) if body else {}
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8")
+        if expected_statuses and exc.code in expected_statuses:
+            return exc.code, json.loads(body) if body else {}
+        raise RuntimeError(f"Kubernetes API {method} {url} failed with {exc.code}: {body}") from exc
 
 
 # Reserve a random localhost port for kubectl port-forward to expose Vault temporarily.
@@ -94,25 +137,22 @@ def find_free_port():
 
 
 # Wait until the first Vault pod exists and reaches Running so the bootstrap can begin.
-def wait_for_pod_running(namespace, pod_name):
+def wait_for_pod_running(namespace, pod_name, kubernetes_host, cluster_name, region):
     log(f"Waiting for {pod_name} to reach Running phase")
     deadline = time.time() + 900
+    pod_name_escaped = urllib.parse.quote(pod_name, safe="")
+    namespace_escaped = urllib.parse.quote(namespace, safe="")
     while time.time() < deadline:
-        result = run(
-            [
-                "kubectl",
-                "-n",
-                namespace,
-                "get",
-                "pod",
-                pod_name,
-                "-o",
-                "jsonpath={.status.phase}",
-            ],
-            check=False,
+        status_code, payload = kubernetes_request(
+            "GET",
+            kubernetes_host,
+            f"/api/v1/namespaces/{namespace_escaped}/pods/{pod_name_escaped}",
+            cluster_name,
+            region,
+            expected_statuses={200, 404},
         )
-        phase = result.stdout.strip()
-        if result.returncode == 0 and phase == "Running":
+        phase = payload.get("status", {}).get("phase") if status_code == 200 else None
+        if phase == "Running":
             log(f"{pod_name} is Running")
             return
         time.sleep(5)
@@ -161,6 +201,27 @@ def wait_for_vault(base_url):
     raise RuntimeError("Vault did not become reachable within 10 minutes")
 
 
+# After initialization, wait for Vault to finish auto-unseal and elect a leader.
+def wait_for_vault_post_init(base_url):
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        try:
+            status, _ = request(
+                "GET",
+                f"{base_url}/v1/sys/health",
+                expected_statuses={200, 429, 472, 473, 501, 503},
+                timeout=30,
+            )
+            if status in {200, 429, 472, 473}:
+                log(f"Vault is ready for bootstrap operations with health status {status}")
+                return
+        except Exception:
+            pass
+        time.sleep(5)
+
+    raise RuntimeError("Vault did not become ready for bootstrap operations within 5 minutes after initialization")
+
+
 # Load previously persisted initialization data so reruns can reuse the root token safely.
 def load_existing_credentials(output_file):
     if not os.path.exists(output_file):
@@ -170,34 +231,91 @@ def load_existing_credentials(output_file):
         return json.load(handle)
 
 
-# Persist the initialization response produced by Vault for later administrative actions.
-def persist_credentials(output_file, init_response):
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    payload = {
+# Load credentials from S3. Returns None if the object does not exist yet.
+def load_existing_credentials_s3(s3_uri):
+    result = subprocess.run(
+        ["aws", "s3", "cp", s3_uri, "-"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+# Build the credentials payload shared by both local and S3 persistence paths.
+def _build_credentials_payload(init_response):
+    return {
         "initialized_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "root_token": init_response["root_token"],
         "recovery_keys_b64": init_response.get("recovery_keys_b64", []),
         "recovery_keys_hex": init_response.get("recovery_keys_hex", []),
     }
+
+
+# Persist the initialization response produced by Vault for later administrative actions.
+def persist_credentials(output_file, init_response):
+    parent = os.path.dirname(output_file)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    payload = _build_credentials_payload(init_response)
     with open(output_file, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
         handle.write("\n")
     log(f"Bootstrap credentials saved to {output_file}")
 
 
+# Upload credentials directly to S3 with SSE-KMS encryption. No local file is written.
+def persist_credentials_s3(s3_uri, init_response):
+    payload = _build_credentials_payload(init_response)
+    content = json.dumps(payload, indent=2) + "\n"
+    result = subprocess.run(
+        ["aws", "s3", "cp", "-", s3_uri, "--sse", "aws:kms"],
+        input=content,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to upload credentials to S3 ({s3_uri}): {result.stderr.strip()}")
+    log(f"Bootstrap credentials saved to {s3_uri}")
+
+
 # Initialize Vault once and return the root token; on reruns, reuse the stored token.
-def ensure_initialized(base_url, output_file):
-    status, payload = request("GET", f"{base_url}/v1/sys/init")
+def ensure_initialized(base_url, output_file, output_s3_uri=None):
+    status, payload = request("GET", f"{base_url}/v1/sys/init", timeout=30)
     if status != 200:
         raise RuntimeError(f"Unexpected status from /sys/init: {status}")
 
     if payload.get("initialized"):
         log("Vault is already initialized")
-        existing = load_existing_credentials(output_file)
+        existing = None
+        if output_s3_uri:
+            log(f"Loading existing credentials from {output_s3_uri}")
+            existing = load_existing_credentials_s3(output_s3_uri)
+        if not existing:
+            existing = load_existing_credentials(output_file)
         if not existing or not existing.get("root_token"):
             raise RuntimeError(
-                "Vault is already initialized, but no local root token file was found at "
-                f"{output_file}. Restore that file or re-run with a known root token manually."
+                "Vault is already initialized, but no credentials file was found at "
+                f"{output_s3_uri or output_file}. Restore that file or re-run with a known root token manually."
+            )
+        status, _ = request(
+            "GET",
+            f"{base_url}/v1/auth/token/lookup-self",
+            token=existing["root_token"],
+            expected_statuses={200, 403},
+            timeout=30,
+        )
+        if status == 403:
+            raise RuntimeError(
+                "Vault is already initialized, but the root token stored in "
+                f"{output_s3_uri or output_file} is invalid for the current Vault cluster. "
+                "This usually means the bootstrap file and the Raft data are out of sync."
             )
         return existing["root_token"]
 
@@ -210,8 +328,12 @@ def ensure_initialized(base_url, output_file):
             "recovery_threshold": 3,
         },
         expected_statuses={200},
+        timeout=120,
     )
-    persist_credentials(output_file, init_response)
+    if output_s3_uri:
+        persist_credentials_s3(output_s3_uri, init_response)
+    else:
+        persist_credentials(output_file, init_response)
     return init_response["root_token"]
 
 
@@ -235,8 +357,34 @@ def ensure_kv_v2(base_url, token):
     )
 
 
+# Request a short-lived reviewer JWT directly from the Kubernetes TokenRequest API.
+def create_service_account_token(namespace, service_account, kubernetes_host, cluster_name, region):
+    log("Issuing token for Vault service account")
+    namespace_escaped = urllib.parse.quote(namespace, safe="")
+    service_account_escaped = urllib.parse.quote(service_account, safe="")
+    _, payload = kubernetes_request(
+        "POST",
+        kubernetes_host,
+        f"/api/v1/namespaces/{namespace_escaped}/serviceaccounts/{service_account_escaped}/token",
+        cluster_name,
+        region,
+        payload={
+            "apiVersion": "authentication.k8s.io/v1",
+            "kind": "TokenRequest",
+            "spec": {
+                "expirationSeconds": 86400,
+            },
+        },
+        expected_statuses={201},
+    )
+    reviewer_jwt = payload.get("status", {}).get("token")
+    if not reviewer_jwt:
+        raise RuntimeError("Kubernetes TokenRequest API returned an empty reviewer JWT")
+    return reviewer_jwt
+
+
 # Enable and configure the Kubernetes auth method so workloads can authenticate to Vault.
-def ensure_kubernetes_auth(base_url, token, namespace, service_account, kubernetes_host, kubernetes_ca_b64):
+def ensure_kubernetes_auth(base_url, token, namespace, service_account, kubernetes_host, kubernetes_ca_b64, cluster_name, region):
     _, auth_methods = request("GET", f"{base_url}/v1/sys/auth", token=token)
     if "kubernetes/" not in auth_methods:
         log("Enabling auth method kubernetes")
@@ -250,21 +398,13 @@ def ensure_kubernetes_auth(base_url, token, namespace, service_account, kubernet
     else:
         log("Auth method kubernetes is already enabled")
 
-    log("Issuing token for Vault service account")
-    token_result = run(
-        [
-            "kubectl",
-            "-n",
-            namespace,
-            "create",
-            "token",
-            service_account,
-            "--duration=24h",
-        ]
+    reviewer_jwt = create_service_account_token(
+        namespace,
+        service_account,
+        kubernetes_host,
+        cluster_name,
+        region,
     )
-    reviewer_jwt = token_result.stdout.strip()
-    if not reviewer_jwt:
-        raise RuntimeError("kubectl create token returned an empty reviewer JWT")
 
     kubernetes_ca_cert = base64.b64decode(kubernetes_ca_b64).decode("utf-8")
     log("Configuring Vault Kubernetes auth backend")
@@ -380,6 +520,94 @@ def ensure_postgres_role(base_url, token, args):
     )
 
 
+def ensure_policy(base_url, token, name, policy):
+    log(f"Configuring policy {name}")
+    request(
+        "PUT",
+        f"{base_url}/v1/sys/policies/acl/{name}",
+        payload={"policy": policy},
+        token=token,
+        expected_statuses={200, 204},
+    )
+
+
+def normalize_oidc_discovery_url(url):
+    normalized = url.strip()
+    if not normalized:
+        return normalized
+
+    if normalized.endswith("/.well-known/openid-configuration"):
+        normalized = normalized[: -len("/.well-known/openid-configuration")]
+
+    parsed = urllib.parse.urlparse(normalized)
+    if parsed.scheme and parsed.netloc and parsed.path in {"", "/"}:
+        return f"{parsed.scheme}://{parsed.netloc}/"
+
+    if not normalized.endswith("/"):
+        return f"{normalized}/"
+
+    return normalized
+
+
+def ensure_oidc_auth(base_url, token, args):
+    if not args.oidc_discovery_url or not args.oidc_client_id or not args.oidc_client_secret or not args.oidc_bound_email:
+        log("OIDC inputs were not fully provided, skipping OIDC configuration")
+        return
+
+    oidc_discovery_url = normalize_oidc_discovery_url(args.oidc_discovery_url)
+
+    _, auth_methods = request("GET", f"{base_url}/v1/sys/auth", token=token)
+    if "oidc/" not in auth_methods:
+        log("Enabling auth method oidc")
+        request(
+            "POST",
+            f"{base_url}/v1/sys/auth/oidc",
+            payload={"type": "oidc"},
+            token=token,
+            expected_statuses={204},
+        )
+    else:
+        log("Auth method oidc is already enabled")
+
+    redirect_uris = [
+        f"https://{args.vault_hostname}/ui/vault/auth/oidc/oidc/callback",
+        "http://localhost:8250/oidc/callback",
+    ]
+
+    log("Configuring Vault OIDC auth backend")
+    request(
+        "POST",
+        f"{base_url}/v1/auth/oidc/config",
+        payload={
+            "oidc_discovery_url": oidc_discovery_url,
+            "oidc_client_id": args.oidc_client_id,
+            "oidc_client_secret": args.oidc_client_secret,
+            "default_role": args.oidc_role_name,
+            "bound_issuer": oidc_discovery_url,
+        },
+        token=token,
+        expected_statuses={204},
+    )
+
+    log(f"Configuring Vault OIDC role {args.oidc_role_name}")
+    request(
+        "POST",
+        f"{base_url}/v1/auth/oidc/role/{args.oidc_role_name}",
+        payload={
+            "role_type": "oidc",
+            "user_claim": "email",
+            "bound_claims": {
+                "email": args.oidc_bound_email,
+            },
+            "allowed_redirect_uris": redirect_uris,
+            "oidc_scopes": ["openid", "profile", "email"],
+            "policies": ["admin"],
+        },
+        token=token,
+        expected_statuses={200, 204},
+    )
+
+
 # Define the Terraform-provided inputs required to initialize Vault and configure integrations.
 def parse_args():
     parser = argparse.ArgumentParser(description="Bootstrap Vault after Terraform apply")
@@ -390,8 +618,11 @@ def parse_args():
     parser.add_argument("--kubernetes-host", required=True)
     parser.add_argument("--kubernetes-ca-b64", required=True)
     parser.add_argument("--vault-ca-cert-b64", required=True)
-    parser.add_argument("--output-file", required=True)
-    parser.add_argument("--log-file", default=None)
+    parser.add_argument("--output-file", required=True,
+                        help="Caminho local para salvar vault-init.json (usado em runs locais).")
+    parser.add_argument("--output-s3-uri", default=None,
+                        help="URI S3 para salvar vault-init.json diretamente no bucket (ex: s3://bucket/path/vault-init.json). "
+                             "Quando fornecido, o arquivo NÃO é gravado localmente.")
     parser.add_argument("--postgres-host", required=True)
     parser.add_argument("--postgres-port", required=True, type=int)
     parser.add_argument("--postgres-database-name", required=True)
@@ -399,28 +630,33 @@ def parse_args():
     parser.add_argument("--postgres-admin-password", required=True)
     parser.add_argument("--vault-db-connection-name", default="postgres")
     parser.add_argument("--vault-db-role-name", default="postgres-dynamic")
+    parser.add_argument("--vault-hostname", required=True)
+    parser.add_argument("--oidc-discovery-url", default="")
+    parser.add_argument("--oidc-client-id", default="")
+    parser.add_argument("--oidc-client-secret", default="")
+    parser.add_argument("--oidc-bound-email", default="")
+    parser.add_argument("--oidc-role-name", default="auth0-admin")
     return parser.parse_args()
 
 
 # Orchestrate the full bootstrap sequence from connectivity checks to engine/auth/database setup.
 def main():
-    global TLS_CONTEXT
+    global TLS_CONTEXT, KUBERNETES_CONTEXT
 
     args = parse_args()
-    initialize_log_file(args.log_file)
-    if args.log_file:
-        log(f"Writing debug log to {args.log_file}")
     TLS_CONTEXT = build_tls_context(args.vault_ca_cert_b64)
+    KUBERNETES_CONTEXT = build_kubernetes_context(args.kubernetes_ca_b64)
 
     pod_name = "vault-0"
-    wait_for_pod_running(args.namespace, pod_name)
+    wait_for_pod_running(args.namespace, pod_name, args.kubernetes_host, args.cluster_name, args.region)
 
     local_port = find_free_port()
     process = start_port_forward(args.namespace, pod_name, local_port)
     try:
         base_url = f"https://127.0.0.1:{local_port}"
         wait_for_vault(base_url)
-        root_token = ensure_initialized(base_url, args.output_file)
+        root_token = ensure_initialized(base_url, args.output_file, args.output_s3_uri)
+        wait_for_vault_post_init(base_url)
         ensure_kv_v2(base_url, root_token)
         ensure_kubernetes_auth(
             base_url,
@@ -429,12 +665,21 @@ def main():
             args.service_account,
             args.kubernetes_host,
             args.kubernetes_ca_b64,
+            args.cluster_name,
+            args.region,
         )
         ensure_audit_stdout(base_url, root_token)
         ensure_client_counters(base_url, root_token)
         ensure_database_secrets_engine(base_url, root_token)
         ensure_postgres_connection(base_url, root_token, args)
         ensure_postgres_role(base_url, root_token, args)
+        ensure_policy(
+            base_url,
+            root_token,
+            "admin",
+            'path "*" {\n  capabilities = ["create", "read", "update", "delete", "list", "patch", "sudo"]\n}\n',
+        )
+        ensure_oidc_auth(base_url, root_token, args)
         log("Vault bootstrap completed successfully")
     finally:
         process.terminate()
@@ -442,8 +687,6 @@ def main():
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             process.kill()
-        if LOG_FILE_HANDLE is not None:
-            LOG_FILE_HANDLE.close()
 
 
 # Fail fast with a clear message so Terraform surfaces bootstrap issues immediately.
@@ -452,6 +695,4 @@ if __name__ == "__main__":
         main()
     except Exception as exc:
         log(str(exc))
-        if LOG_FILE_HANDLE is not None:
-            LOG_FILE_HANDLE.close()
         sys.exit(1)

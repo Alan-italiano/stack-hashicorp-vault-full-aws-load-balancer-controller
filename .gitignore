@@ -15,8 +15,9 @@ override.tf.json
 *.tfvars
 *.tfvars.json
 
-# Keep shareable examples
+# Keep shareable examples and CI var files
 !*.tfvars.example
+!*.tfvars.ci
 
 # Sensitive bootstrap outputs and local logs
 bootstrap/vault-init.json

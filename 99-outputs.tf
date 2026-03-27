@@ -8,6 +8,11 @@ output "eks_cluster_endpoint" {
   description = "EKS API endpoint"
 }
 
+output "eks_cluster_certificate_authority_data" {
+  value       = module.eks.cluster_certificate_authority_data
+  description = "Base64-encoded CA certificate for the EKS cluster API"
+}
+
 output "vault_kms_key_arn" {
   value       = aws_kms_key.vault_unseal.arn
   description = "KMS key ARN used by Vault auto-unseal"
@@ -81,4 +86,51 @@ output "postgres_internal_port" {
 output "postgres_external_service" {
   value       = "postgres-service.${local.postgres_namespace}"
   description = "Kubernetes service name exposed externally via LoadBalancer"
+}
+
+# ── Outputs usados pelo step de bootstrap no GitHub Actions ───────────────────
+
+output "vault_namespace" {
+  value       = local.vault_namespace
+  description = "Kubernetes namespace onde o Vault está instalado"
+}
+
+output "vault_service_account" {
+  value       = local.vault_service_account
+  description = "Service account do Vault no Kubernetes"
+}
+
+output "vault_hostname" {
+  value       = var.vault_hostname
+  description = "Hostname do Vault (sem https://)"
+}
+
+output "postgres_database_name" {
+  value       = var.postgres_database_name
+  description = "Nome do banco de dados PostgreSQL"
+}
+
+output "postgres_admin_username" {
+  value       = var.postgres_admin_username
+  description = "Usuário administrador do PostgreSQL"
+}
+
+output "vault_oidc_discovery_url" {
+  value       = coalesce(var.vault_oidc_discovery_url, "")
+  description = "OIDC discovery URL configurada no Vault"
+}
+
+output "vault_oidc_client_id" {
+  value       = coalesce(var.vault_oidc_client_id, "")
+  description = "OIDC client ID configurado no Vault"
+}
+
+output "vault_oidc_bound_email" {
+  value       = coalesce(var.vault_oidc_bound_email, "")
+  description = "Email vinculado ao role OIDC de administrador"
+}
+
+output "vault_oidc_role_name" {
+  value       = var.vault_oidc_role_name
+  description = "Nome do role OIDC criado no Vault"
 }

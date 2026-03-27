@@ -22,6 +22,12 @@ variable "kubernetes_version" {
   default     = "1.30"
 }
 
+variable "cluster_service_ipv4_cidr" {
+  description = "CIDR used by Kubernetes Services in the EKS cluster"
+  type        = string
+  default     = "172.20.0.0/16"
+}
+
 variable "vault_hostname" {
   description = "Vault FQDN"
   type        = string
@@ -94,6 +100,12 @@ variable "vault_snapshot_bucket_name" {
   default     = "vault-lab-snapshots-unique"
 }
 
+variable "vault_snapshot_bucket_admin_principal_arns" {
+  description = "Additional IAM principal ARNs allowed to administer and read the Vault snapshots bucket"
+  type        = list(string)
+  default     = []
+}
+
 variable "vpc_cidr" {
   description = "VPC CIDR"
   type        = string
@@ -150,4 +162,41 @@ variable "postgres_admin_password" {
   description = "PostgreSQL admin password"
   type        = string
   sensitive   = true
+}
+
+variable "vault_oidc_discovery_url" {
+  description = "OIDC discovery URL used by Vault"
+  type        = string
+  default     = null
+}
+
+variable "vault_oidc_client_id" {
+  description = "OIDC client ID used by Vault"
+  type        = string
+  default     = null
+}
+
+variable "vault_oidc_client_secret" {
+  description = "OIDC client secret used by Vault"
+  type        = string
+  sensitive   = true
+  default     = null
+}
+
+variable "vault_oidc_bound_email" {
+  description = "Email claim allowed to authenticate in the Vault OIDC admin role"
+  type        = string
+  default     = null
+}
+
+variable "vault_oidc_role_name" {
+  description = "Vault role name created for OIDC authentication"
+  type        = string
+  default     = "auth0-admin"
+}
+
+variable "vault_bootstrap_enabled" {
+  description = "Executa o bootstrap do Vault via null_resource local-exec. Desabilite em CI (false) e execute o bootstrap como step separado no workflow."
+  type        = bool
+  default     = true
 }
