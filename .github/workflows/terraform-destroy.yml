@@ -15,16 +15,17 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TOFU_VERSION: "1.8.3"
-  AWS_REGION:   "us-east-1"
-  CLUSTER_NAME: "vault-eks-lab"
-  TF_STATE_KEY: "vault-eks-alb-lab/terraform.tfstate"
+  TOFU_VERSION:    "1.8.3"
+  KUBECTL_VERSION: "v1.30.9"
+  AWS_REGION:      "us-east-1"
+  CLUSTER_NAME:    "vault-eks-lab"
+  TF_STATE_KEY:    "vault-eks-alb-lab/terraform.tfstate"
 
 jobs:
   destroy:
     name: Plan & Destroy
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       # ── 0. Validação de segurança ─────────────────────────────────────────
@@ -46,6 +47,11 @@ jobs:
         with:
           tofu_version: ${{ env.TOFU_VERSION }}
           tofu_wrapper: false
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
 
       # ── 3. Credenciais AWS ────────────────────────────────────────────────
       - name: Configure AWS credentials
@@ -77,7 +83,54 @@ jobs:
           TF_VAR_postgres_admin_password:  ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
           TF_VAR_vault_oidc_client_secret: ${{ secrets.VAULT_OIDC_CLIENT_SECRET }}
 
-      # ── 5. Terraform Plan -destroy ────────────────────────────────────────
+      # ── 6. Pré-destroy: remove recursos K8s que criam AWS resources ────────
+      # O AWS Load Balancer Controller e o serviço postgres criam recursos AWS
+      # (ALB, NLB/ELB) fora do controle direto do Terraform. Se esses recursos
+      # ainda existirem quando o Terraform tentar deletar a VPC, as subnets e o
+      # IGW ficam bloqueados por ENIs pendentes. Este step garante que o ALB e o
+      # ELB sejam removidos ANTES do destroy da infraestrutura.
+      - name: Configure kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ env.CLUSTER_NAME }}" \
+            --region "${{ env.AWS_REGION }}"
+
+      - name: Pre-destroy - remove Kubernetes Ingress resources (triggers ALB deletion)
+        run: |
+          echo "Deletando Ingress resources para forçar remoção dos ALBs..."
+          kubectl delete ingress vault-alb      -n vault      --ignore-not-found --timeout=5m
+          kubectl delete ingress grafana-alb    -n monitoring --ignore-not-found --timeout=5m
+          echo "Ingress deletados."
+
+      - name: Pre-destroy - remove postgres LoadBalancer service (triggers ELB deletion)
+        run: |
+          echo "Deletando postgres LoadBalancer service..."
+          kubectl delete service postgres-service -n postgres --ignore-not-found --timeout=5m
+          echo "Serviço deletado."
+
+      - name: Pre-destroy - wait for ALB/ELB to be fully removed by AWS
+        run: |
+          echo "Aguardando AWS remover os load balancers (até 10min)..."
+          DEADLINE=$((SECONDS + 600))
+          while [ $SECONDS -lt $DEADLINE ]; do
+            COUNT=$(aws elbv2 describe-load-balancers \
+              --query "LoadBalancers[?contains(DNSName, 'k8s-vault') || contains(DNSName, 'k8s-monitoring')].DNSName" \
+              --output text 2>/dev/null | wc -w)
+            if [ "$COUNT" -eq 0 ]; then
+              echo "Todos os ALBs foram removidos."
+              break
+            fi
+            echo "  Ainda existem $COUNT ALB(s). Aguardando..."
+            sleep 15
+          done
+
+          # Verificação final — não bloqueia o destroy se ainda restar algum
+          REMAINING=$(aws elbv2 describe-load-balancers \
+            --query "length(LoadBalancers[?contains(DNSName, 'k8s-vault') || contains(DNSName, 'k8s-monitoring')])" \
+            --output text 2>/dev/null || echo "0")
+          echo "ALBs restantes após espera: ${REMAINING:-0}"
+
+      # ── 7. Terraform Plan -destroy ────────────────────────────────────────
       - name: Terraform Plan (destroy)
         run: |
           tofu plan \
@@ -99,7 +152,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ── 6. Terraform Destroy ──────────────────────────────────────────────
+      # ── 8. Terraform Destroy ──────────────────────────────────────────────
       - name: Terraform Destroy
         run: tofu apply -auto-approve destroy.tfplan
         env:

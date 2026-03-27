@@ -157,6 +157,10 @@ resource "kubernetes_ingress_v1" "vault" {
     }
   }
 
+  timeouts {
+    delete = "15m"
+  }
+
   depends_on = [
     aws_acm_certificate_validation.edge,
     aws_wafv2_web_acl.edge,
@@ -209,6 +213,10 @@ resource "kubernetes_ingress_v1" "grafana" {
         }
       }
     }
+  }
+
+  timeouts {
+    delete = "15m"
   }
 
   depends_on = [
