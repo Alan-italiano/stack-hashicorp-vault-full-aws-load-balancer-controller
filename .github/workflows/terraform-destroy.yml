@@ -259,19 +259,32 @@ jobs:
 
           echo "Todos os node groups deletados. ENIs das instâncias liberadas."
 
-      # ── 9. Remove recursos pre-deletados do Terraform state ───────────────
-      - name: Remove pre-deleted resources from Terraform state
+      # ── 9. Remove recursos Kubernetes/Helm do Terraform state ────────────
+      # Quando os node groups são deletados no passo anterior, todos os pods
+      # morrem — incluindo controllers (LB Controller, EBS CSI Driver, etc.).
+      # Se o tofu destroy tentar destruir kubernetes_namespace ou helm_release,
+      # o Kubernetes provider aguarda finalizers que nunca serão removidos
+      # (controllers mortos) → context deadline exceeded.
+      #
+      # Solução: remover TODOS os recursos kubernetes_* e helm_release do state.
+      # O tofu destroy opera apenas sobre recursos AWS (EKS, VPC, IAM, etc.),
+      # que são destruídos via API sem depender dos controllers k8s.
+      # O etcd (e todos os objetos k8s) é destruído junto com o control plane.
+      - name: Remove Kubernetes and Helm resources from Terraform state
         run: |
-          # K8s resources (ingress/service) deletados via kubectl no passo 5
-          tofu state rm kubernetes_ingress_v1.vault    || true
-          tofu state rm kubernetes_ingress_v1.grafana  || true
-          tofu state rm kubernetes_service_v1.postgres || true
+          echo "Removendo recursos kubernetes_* e helm_release do state..."
+          tofu state list 2>/dev/null \
+            | grep -E '^(kubernetes_|helm_release\.|kubectl_manifest\.)' \
+            | while read -r addr; do
+                echo "  Removendo: $addr"
+                tofu state rm "$addr" || true
+              done
 
-          # Node groups deletados via AWS CLI no passo 8
+          echo "Removendo node groups deletados do state..."
           tofu state list 2>/dev/null \
             | grep 'aws_eks_node_group' \
             | while read -r addr; do
-                echo "  Removendo do state: $addr"
+                echo "  Removendo: $addr"
                 tofu state rm "$addr" || true
               done
         env:
