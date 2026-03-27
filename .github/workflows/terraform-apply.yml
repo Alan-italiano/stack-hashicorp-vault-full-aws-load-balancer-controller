@@ -67,7 +67,38 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      # ── 4. Terraform Init ─────────────────────────────────────────────────
+      # ── 4. Garante que o bucket de state S3 existe ────────────────────────
+      # Idempotente: cria o bucket, habilita versionamento e bloqueia acesso público.
+      # Se o bucket já existir, os comandos apenas confirmam o estado atual.
+      - name: Ensure Terraform state bucket exists
+        run: |
+          BUCKET="${{ secrets.TF_STATE_BUCKET }}"
+          REGION="${{ env.AWS_REGION }}"
+
+          if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "Bucket $BUCKET já existe."
+          else
+            echo "Criando bucket $BUCKET em $REGION..."
+            if [[ "$REGION" == "us-east-1" ]]; then
+              aws s3api create-bucket --bucket "$BUCKET" --region "$REGION"
+            else
+              aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" \
+                --create-bucket-configuration LocationConstraint="$REGION"
+            fi
+          fi
+
+          aws s3api put-bucket-versioning \
+            --bucket "$BUCKET" \
+            --versioning-configuration Status=Enabled
+
+          aws s3api put-public-access-block \
+            --bucket "$BUCKET" \
+            --public-access-block-configuration \
+              BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+          echo "Bucket $BUCKET pronto."
+
+      # ── 5. Terraform Init ─────────────────────────────────────────────────
       - name: Terraform Init
         run: |
           tofu init \

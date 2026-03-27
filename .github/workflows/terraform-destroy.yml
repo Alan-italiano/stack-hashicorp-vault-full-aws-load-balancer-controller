@@ -55,7 +55,17 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      # ── 4. Terraform Init ─────────────────────────────────────────────────
+      # ── 4. Verifica que o bucket de state existe ──────────────────────────
+      - name: Verify Terraform state bucket exists
+        run: |
+          BUCKET="${{ secrets.TF_STATE_BUCKET }}"
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "ERRO: bucket de state '$BUCKET' não encontrado. Execute o workflow de Apply primeiro."
+            exit 1
+          fi
+          echo "Bucket $BUCKET encontrado."
+
+      # ── 5. Terraform Init ─────────────────────────────────────────────────
       - name: Terraform Init
         run: |
           tofu init \
