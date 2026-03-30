@@ -520,6 +520,56 @@ def ensure_postgres_role(base_url, token, args):
     )
 
 
+def ensure_approle_auth(base_url, token):
+    _, auth_methods = request("GET", f"{base_url}/v1/sys/auth", token=token)
+    if "approle/" not in auth_methods:
+        log("Enabling auth method approle")
+        request(
+            "POST",
+            f"{base_url}/v1/sys/auth/approle",
+            payload={"type": "approle"},
+            token=token,
+            expected_statuses={204},
+        )
+    else:
+        log("Auth method approle is already enabled")
+
+
+def ensure_ssh_rotator_role(base_url, token):
+    log("Configuring AppRole role ssh-rotator")
+    request(
+        "POST",
+        f"{base_url}/v1/auth/approle/role/ssh-rotator",
+        payload={
+            "token_policies": ["ssh-rotator"],
+            "token_ttl": "5m",
+            "token_max_ttl": "10m",
+        },
+        token=token,
+        expected_statuses={204},
+    )
+
+
+def print_ssh_rotator_credentials(base_url, token):
+    _, role_id_response = request(
+        "GET",
+        f"{base_url}/v1/auth/approle/role/ssh-rotator/role-id",
+        token=token,
+        expected_statuses={200},
+    )
+    role_id = role_id_response.get("data", {}).get("role_id", "")
+    log(f"AppRole role_id:   {role_id}")
+
+    _, secret_id_response = request(
+        "POST",
+        f"{base_url}/v1/auth/approle/role/ssh-rotator/secret-id",
+        token=token,
+        expected_statuses={200},
+    )
+    secret_id = secret_id_response.get("data", {}).get("secret_id", "")
+    log(f"AppRole secret_id: {secret_id}")
+
+
 def ensure_policy(base_url, token, name, policy):
     log(f"Configuring policy {name}")
     request(
@@ -680,6 +730,15 @@ def main():
             'path "*" {\n  capabilities = ["create", "read", "update", "delete", "list", "patch", "sudo"]\n}\n',
         )
         ensure_oidc_auth(base_url, root_token, args)
+        ensure_approle_auth(base_url, root_token)
+        ensure_policy(
+            base_url,
+            root_token,
+            "ssh-rotator",
+            'path "secret/data/ssh-passwords/*" {\n  capabilities = ["create", "update"]\n}\n',
+        )
+        ensure_ssh_rotator_role(base_url, root_token)
+        print_ssh_rotator_credentials(base_url, root_token)
         log("Vault bootstrap completed successfully")
     finally:
         process.terminate()
