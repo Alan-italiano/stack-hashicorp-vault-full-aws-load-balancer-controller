@@ -735,7 +735,7 @@ def main():
             base_url,
             root_token,
             "ssh-rotator",
-            'path "secret/data/ssh-passwords/*" {\n  capabilities = ["create", "update"]\n}\n',
+            'path "kv/data/ssh-passwords/*" {\n  capabilities = ["create", "update"]\n}\n',
         )
         ensure_ssh_rotator_role(base_url, root_token)
         print_ssh_rotator_credentials(base_url, root_token)
