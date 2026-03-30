@@ -2,6 +2,8 @@ resource "kubernetes_namespace" "external_dns" {
   metadata {
     name = local.external_dns_namespace
   }
+
+  depends_on = [time_sleep.eks_access_ready]
 }
 
 resource "helm_release" "aws_load_balancer_controller" {
@@ -30,7 +32,8 @@ resource "helm_release" "aws_load_balancer_controller" {
   ]
 
   depends_on = [
-    module.irsa_aws_load_balancer_controller
+    module.irsa_aws_load_balancer_controller,
+    time_sleep.eks_access_ready,
   ]
 }
 

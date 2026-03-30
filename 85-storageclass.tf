@@ -16,4 +16,6 @@ resource "kubernetes_storage_class_v1" "vault_ebs_gp3" {
     fsType    = "ext4"
     encrypted = "true"
   }
+
+  depends_on = [time_sleep.eks_access_ready]
 }

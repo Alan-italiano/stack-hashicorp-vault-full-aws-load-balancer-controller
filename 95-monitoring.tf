@@ -2,6 +2,8 @@ resource "kubernetes_namespace" "monitoring" {
   metadata {
     name = local.monitoring_namespace
   }
+
+  depends_on = [time_sleep.eks_access_ready]
 }
 
 resource "helm_release" "kube_prometheus_stack" {

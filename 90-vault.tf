@@ -2,6 +2,8 @@ resource "kubernetes_namespace" "vault" {
   metadata {
     name = local.vault_namespace
   }
+
+  depends_on = [time_sleep.eks_access_ready]
 }
 
 resource "kubernetes_role_v1" "vault_discovery" {
